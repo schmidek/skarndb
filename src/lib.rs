@@ -13,17 +13,17 @@ impl Database {
         }
     }
 
-    fn insert(&self, key: &[u8], value: &[u8]) {
+    fn insert<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, key: K, value: V) {
         let mut map = self.mem_table.write().expect("RwLock poisoned");
         map.insert(
-            key.to_vec().into_boxed_slice(),
-            value.to_vec().into_boxed_slice(),
+            key.as_ref().to_vec().into_boxed_slice(),
+            value.as_ref().to_vec().into_boxed_slice(),
         );
     }
 
-    fn get(&self, key: &[u8]) -> Option<Box<[u8]>> {
+    fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<Box<[u8]>> {
         let map = self.mem_table.read().expect("RwLock poisoned");
-        map.get(key).map(|v| v.clone())
+        map.get(key.as_ref()).map(|v| v.clone())
     }
 }
 
@@ -65,7 +65,7 @@ mod tests {
             let db_ref = Arc::clone(&db);
             threads.push(thread::spawn(move || {
                 let value = String::from("value");
-                db_ref.insert(&i.to_be_bytes(), value.as_bytes());
+                db_ref.insert(i.to_be_bytes(), value.as_bytes());
             }));
         }
 
