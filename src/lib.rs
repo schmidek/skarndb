@@ -1,9 +1,13 @@
+mod disk_table;
 mod mem_table;
 
-use std::fs::File;
-use std::sync::RwLock;
-use mem_table::MemTable;
+use crate::disk_table::DiskTable;
 use core::mem;
+use mem_table::MemTable;
+use std::fs::{create_dir_all, File};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct MemTableConfig {
@@ -13,7 +17,7 @@ pub struct MemTableConfig {
 impl MemTableConfig {
     pub fn default() -> MemTableConfig {
         MemTableConfig {
-            max_size: 1_000_000
+            max_size: 1_000_000,
         }
     }
 
@@ -23,21 +27,84 @@ impl MemTableConfig {
     }
 }
 
+#[derive(Clone)]
+pub struct DiskTableConfig {
+    pub block_size: usize, // max size of mem table in bytes
+}
+
+impl DiskTableConfig {
+    pub fn default() -> DiskTableConfig {
+        DiskTableConfig {
+            block_size: 64 * 1024,
+        }
+    }
+
+    pub fn block_size(mut self, block_size: usize) -> Self {
+        self.block_size = block_size;
+        self
+    }
+}
+
+#[derive(Clone)]
+pub struct DatabaseConfig {
+    pub mem_table_config: MemTableConfig,
+    pub disk_table_config: DiskTableConfig,
+    pub directory: Option<PathBuf>,
+}
+
+impl DatabaseConfig {
+    pub fn default() -> DatabaseConfig {
+        DatabaseConfig {
+            mem_table_config: MemTableConfig::default(),
+            disk_table_config: DiskTableConfig::default(),
+            directory: None,
+        }
+    }
+
+    pub fn mem_table_config(mut self, mem_table_config: MemTableConfig) -> Self {
+        self.mem_table_config = mem_table_config;
+        self
+    }
+
+    pub fn disk_table_config(mut self, disk_table_config: DiskTableConfig) -> Self {
+        self.disk_table_config = disk_table_config;
+        self
+    }
+
+    pub fn directory(mut self, directory: PathBuf) -> Self {
+        self.directory = Some(directory);
+        self
+    }
+}
+
 struct Database {
     mem_table: RwLock<MemTable>,
-    full_mem_tables: RwLock<Vec<MemTable>>,
+    full_mem_tables: RwLock<Vec<Arc<MemTable>>>,
+    disk_tables: RwLock<Vec<DiskTable>>,
+    flush_lock: Mutex<u8>,
+    config: DatabaseConfig,
 }
 
 impl Database {
     fn open() -> Database {
-        Database::open_with_config(MemTableConfig::default())
+        Database::open_with_config(DatabaseConfig::default())
     }
 
-    fn open_with_config(mem_table_config: MemTableConfig) -> Database {
+    fn open_with_config(config: DatabaseConfig) -> Database {
         Database {
-            mem_table: RwLock::new(MemTable::new(mem_table_config)),
+            mem_table: RwLock::new(MemTable::new(config.mem_table_config.clone())),
             full_mem_tables: RwLock::new(Vec::new()),
+            disk_tables: RwLock::new(Vec::new()),
+            flush_lock: Mutex::new(0),
+            config,
         }
+    }
+
+    fn swap_new_mem_table<'a>(&self, map: &mut RwLockWriteGuard<MemTable>) {
+        let mut full_maps = self.full_mem_tables.write().expect("RwLock poisoned");
+        let new_map = MemTable::new(map.config.clone());
+        let old_map: MemTable = mem::replace(&mut (*map), new_map);
+        full_maps.push(Arc::new(old_map));
     }
 
     fn insert<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, key: K, value: V) {
@@ -45,33 +112,89 @@ impl Database {
         while !map.insert(
             key.as_ref().to_vec().into_boxed_slice(),
             value.as_ref().to_vec().into_boxed_slice(),
-        ){
-            let mut full_maps = self.full_mem_tables.write().expect("RwLock poisoned");
-            let new_map = MemTable::new(map.config.clone());
-            full_maps.push(mem::replace(&mut map, new_map));
+        ) {
+            self.swap_new_mem_table(&mut map);
         }
     }
 
     fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<Box<[u8]>> {
         let map = self.mem_table.read().expect("RwLock poisoned");
-        map.get(key.as_ref())
+        let key_ref = key.as_ref();
+        map.get(key_ref)
             .or_else(|| {
-                let full_maps = self.full_mem_tables.read().expect("RwLock poisoned");
-                for full_map in full_maps.iter() {
-                    let ret = full_map.get(key.as_ref());
-                    if ret.is_some() {
-                        return ret;
+                {
+                    let full_maps = self.full_mem_tables.read().expect("RwLock poisoned");
+                    for full_map in full_maps.iter() {
+                        let ret = full_map.get(key_ref);
+                        if ret.is_some() {
+                            return ret;
+                        }
+                    }
+                }
+                {
+                    let disk_tables = self.disk_tables.read().expect("RwLock poisoned");
+                    for disk_table in disk_tables.iter() {
+                        let ret = disk_table.get(key_ref);
+                        if ret.is_some() {
+                            return ret;
+                        }
                     }
                 }
                 None
             })
             .map(|v| v.clone())
     }
+
+    fn is_read_only(&self) -> bool {
+        self.config.directory.is_none() // TODO also have an read only config option so we can support readonly on disk
+    }
+
+    fn flush(&self) {
+        if self.is_read_only() {
+            return;
+        }
+        create_dir_all(self.config.directory.clone().unwrap().as_path())
+            .expect("Failed to create dirs");
+        let _flush_guard = self.flush_lock.lock().expect("Lock Poisoned");
+        {
+            // Flush in progress mem table
+            let mut map = self.mem_table.write().expect("RwLock poisoned");
+            if map.len() > 0 {
+                self.swap_new_mem_table(&mut map);
+            }
+        }
+        // Flush full mem tables
+        loop {
+            let (mem_table, mem_table_index) = {
+                let mem_tables = self.full_mem_tables.read().expect("RWLock poisoned");
+                if mem_tables.is_empty() {
+                    return;
+                }
+                (mem_tables.last().unwrap().clone(), mem_tables.len() - 1)
+            };
+
+            // Creating the disk table should not happen while list needed for gets are locked
+            let mut new_file = self.config.directory.clone().unwrap();
+            new_file.push(Uuid::new_v4().to_string() + ".sst");
+            let disk_table = DiskTable::create(
+                new_file.as_path(),
+                &mem_table,
+                &self.config.disk_table_config,
+            );
+
+            // Lock both and swap
+            let mut disk_tables = self.disk_tables.write().expect("RWLock poisoned");
+            let mut mem_tables = self.full_mem_tables.write().expect("RWLock poisoned");
+            disk_tables.push(disk_table);
+            mem_tables.remove(mem_table_index);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{Database, mem_table, MemTableConfig};
+    use crate::{mem_table, Database, DatabaseConfig, DiskTableConfig, MemTableConfig};
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::thread;
 
@@ -117,8 +240,11 @@ mod tests {
     }
 
     #[test]
-    fn overflow_mem_table(){
-        let db = Database::open_with_config(MemTableConfig::default().max_size(20));
+    fn overflow_mem_table() {
+        let mem_table_config = MemTableConfig::default().max_size(20);
+        let db = Database::open_with_config(
+            DatabaseConfig::default().mem_table_config(mem_table_config),
+        );
 
         let first_key = String::from("first_key");
         let first_value = String::from("first_value");
@@ -135,6 +261,53 @@ mod tests {
             assert_eq!(
                 db.get(first_key.as_bytes()).as_ref().map(|v| &(v[..])),
                 Some(first_value.as_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn disk() {
+        let mem_table_config = MemTableConfig::default().max_size(20);
+        let disk_table_config = DiskTableConfig::default().block_size(1024);
+        let mut directory = PathBuf::new();
+        directory.push("test_db");
+        let db = Database::open_with_config(
+            DatabaseConfig::default()
+                .mem_table_config(mem_table_config)
+                .disk_table_config(disk_table_config)
+                .directory(directory),
+        );
+
+        let first_key = String::from("first_key");
+        let first_value = String::from("first_value");
+        db.insert(first_key.as_bytes(), first_value.as_bytes());
+
+        for i in 0..100 {
+            let key = format!("key{}", i);
+            let value = format!("value{}", i);
+            db.insert(key.as_bytes(), value.as_bytes());
+            assert_eq!(
+                db.get(key.as_bytes()).as_ref().map(|v| &(v[..])),
+                Some(value.as_bytes())
+            );
+            assert_eq!(
+                db.get(first_key.as_bytes()).as_ref().map(|v| &(v[..])),
+                Some(first_value.as_bytes())
+            );
+        }
+
+        db.flush();
+
+        assert_eq!(
+            db.get(first_key.as_bytes()).as_ref().map(|v| &(v[..])),
+            Some(first_value.as_bytes())
+        );
+        for i in 0..100 {
+            let key = format!("key{}", i);
+            let value = format!("value{}", i);
+            assert_eq!(
+                db.get(key.as_bytes()).as_ref().map(|v| &(v[..])),
+                Some(value.as_bytes())
             );
         }
     }
