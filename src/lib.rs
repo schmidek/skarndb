@@ -3,6 +3,7 @@ mod mem_table;
 
 use crate::disk_table::DiskTable;
 use core::mem;
+use itertools::Itertools;
 use mem_table::MemTable;
 use std::fs::{create_dir_all, File};
 use std::path::{Path, PathBuf};
@@ -149,6 +150,12 @@ impl Database {
         self.config.directory.is_none() // TODO also have an read only config option so we can support readonly on disk
     }
 
+    fn new_sst(&self) -> PathBuf {
+        let mut new_file = self.config.directory.clone().unwrap();
+        new_file.push(Uuid::new_v4().to_string() + ".sst");
+        return new_file;
+    }
+
     fn flush(&self) {
         if self.is_read_only() {
             return;
@@ -174,11 +181,9 @@ impl Database {
             };
 
             // Creating the disk table should not happen while list needed for gets are locked
-            let mut new_file = self.config.directory.clone().unwrap();
-            new_file.push(Uuid::new_v4().to_string() + ".sst");
             let disk_table = DiskTable::create(
-                new_file.as_path(),
-                &mem_table,
+                self.new_sst().as_path(),
+                mem_table.iter(),
                 &self.config.disk_table_config,
             );
 
@@ -188,6 +193,21 @@ impl Database {
             disk_tables.push(disk_table);
             mem_tables.remove(mem_table_index);
         }
+    }
+
+    fn compact(&self) {
+        let mut disk_tables = self.disk_tables.write().expect("RWLock poisoned");
+        let iter = disk_tables.iter().map(|t| t.iter()).kmerge();
+        let mut merged = DiskTable::create(
+            self.new_sst().as_path(),
+            iter,
+            &self.config.disk_table_config,
+        );
+        for to_delete in disk_tables.iter_mut() {
+            to_delete.delete();
+        }
+        disk_tables.clear();
+        disk_tables.push(merged);
     }
 }
 
@@ -297,6 +317,21 @@ mod tests {
         }
 
         db.flush();
+
+        assert_eq!(
+            db.get(first_key.as_bytes()).as_ref().map(|v| &(v[..])),
+            Some(first_value.as_bytes())
+        );
+        for i in 0..100 {
+            let key = format!("key{}", i);
+            let value = format!("value{}", i);
+            assert_eq!(
+                db.get(key.as_bytes()).as_ref().map(|v| &(v[..])),
+                Some(value.as_bytes())
+            );
+        }
+
+        db.compact();
 
         assert_eq!(
             db.get(first_key.as_bytes()).as_ref().map(|v| &(v[..])),

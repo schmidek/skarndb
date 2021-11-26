@@ -38,7 +38,7 @@ impl MemTable {
         self.entries.get(key.as_ref()).map(|v| v.clone())
     }
 
-    pub fn iter(&self) -> Iter<Box<[u8]>, Box<[u8]>> {
+    pub fn iter(&self) -> impl Iterator<Item = (&Box<[u8]>, &Box<[u8]>)> {
         self.entries.iter()
     }
 
