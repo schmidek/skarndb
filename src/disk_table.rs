@@ -2,6 +2,7 @@ use crate::mem_table::MemTable;
 use crate::{DiskTableConfig, MemTableConfig};
 use core::cmp;
 use std::borrow::Borrow;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
@@ -16,13 +17,35 @@ pub struct DiskTable {
     file: File,
     path: PathBuf,
     blocks: Vec<Block>,
+    pub age: u64,
 }
+
+impl Ord for DiskTable {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.age.cmp(&other.age).reverse()
+    }
+}
+
+impl PartialOrd for DiskTable {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for DiskTable {
+    fn eq(&self, other: &Self) -> bool {
+        self.age == other.age
+    }
+}
+
+impl Eq for DiskTable {}
 
 impl DiskTable {
     pub fn create<'a, I, R>(
         path: &Path,
         mut iter: I,
         disk_table_config: &DiskTableConfig,
+        age: u64,
     ) -> DiskTable
     where
         I: Iterator<Item = (R, R)>,
@@ -62,6 +85,11 @@ impl DiskTable {
             println!("Creating block");
             loop {
                 if let Some((key, value)) = next.as_ref() {
+                    println!(
+                        "{} {}",
+                        String::from_utf8(key.as_ref().to_vec()).unwrap(),
+                        String::from_utf8(value.as_ref().to_vec()).unwrap()
+                    );
                     let entry = Entry {
                         key: key.as_ref(),
                         value: value.as_ref(),
@@ -121,6 +149,10 @@ impl DiskTable {
         file.write_all(&((blocks.len() as u64).to_le_bytes()))
             .expect("Failed to write to file");
 
+        // Write age
+        file.write_all(&(age.to_le_bytes()))
+            .expect("Failed to write to file");
+
         // Flush then reopen readonly
         file.flush().expect("Failed flush");
         drop(file);
@@ -132,6 +164,7 @@ impl DiskTable {
             file,
             path: path.to_path_buf(),
             blocks,
+            age,
         };
     }
 
@@ -208,7 +241,7 @@ impl DiskTable {
         }
     }
 
-    pub fn delete(&mut self) {
+    pub fn delete(&self) {
         fs::remove_file(self.path.as_path());
     }
 }
@@ -324,7 +357,7 @@ mod tests {
 
     #[test]
     fn write() {
-        let mut mem_table = MemTable::new(MemTableConfig { max_size: 10000 });
+        let mut mem_table = MemTable::new(MemTableConfig { max_size: 10000 }, 0);
 
         for i in 0..500 {
             let key = format!("key{}", i);
@@ -337,6 +370,7 @@ mod tests {
             path,
             mem_table.iter(),
             &DiskTableConfig::default().block_size(2_000),
+            mem_table.age,
         );
 
         for i in 0..500 {

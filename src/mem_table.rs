@@ -1,4 +1,5 @@
 use crate::MemTableConfig;
+use std::cmp::Ordering;
 use std::collections::btree_map::Iter;
 use std::collections::BTreeMap;
 
@@ -6,14 +7,36 @@ pub struct MemTable {
     pub config: MemTableConfig,
     size: usize,
     entries: BTreeMap<Box<[u8]>, Box<[u8]>>,
+    pub age: u64,
 }
 
+impl Ord for MemTable {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.age.cmp(&other.age).reverse()
+    }
+}
+
+impl PartialOrd for MemTable {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for MemTable {
+    fn eq(&self, other: &Self) -> bool {
+        self.age == other.age
+    }
+}
+
+impl Eq for MemTable {}
+
 impl MemTable {
-    pub fn new(config: MemTableConfig) -> MemTable {
+    pub fn new(config: MemTableConfig, age: u64) -> MemTable {
         MemTable {
             config,
             size: 0,
             entries: BTreeMap::new(),
+            age,
         }
     }
 

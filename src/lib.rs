@@ -1,12 +1,17 @@
 mod disk_table;
+mod kmerge_join;
 mod mem_table;
 
+use std::collections::BTreeSet;
+
 use crate::disk_table::DiskTable;
+use crate::kmerge_join::KMergeJoinBy;
 use core::mem;
-use itertools::Itertools;
+
 use mem_table::MemTable;
 use std::fs::{create_dir_all, File};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
 use uuid::Uuid;
 
@@ -80,10 +85,11 @@ impl DatabaseConfig {
 
 struct Database {
     mem_table: RwLock<MemTable>,
-    full_mem_tables: RwLock<Vec<Arc<MemTable>>>,
-    disk_tables: RwLock<Vec<DiskTable>>,
+    full_mem_tables: RwLock<BTreeSet<Arc<MemTable>>>,
+    disk_tables: RwLock<BTreeSet<DiskTable>>,
     flush_lock: Mutex<u8>,
     config: DatabaseConfig,
+    age: AtomicU64,
 }
 
 impl Database {
@@ -93,19 +99,23 @@ impl Database {
 
     fn open_with_config(config: DatabaseConfig) -> Database {
         Database {
-            mem_table: RwLock::new(MemTable::new(config.mem_table_config.clone())),
-            full_mem_tables: RwLock::new(Vec::new()),
-            disk_tables: RwLock::new(Vec::new()),
+            mem_table: RwLock::new(MemTable::new(config.mem_table_config.clone(), 0)),
+            full_mem_tables: RwLock::new(BTreeSet::new()),
+            disk_tables: RwLock::new(BTreeSet::new()),
             flush_lock: Mutex::new(0),
             config,
+            age: AtomicU64::new(0),
         }
     }
 
     fn swap_new_mem_table<'a>(&self, map: &mut RwLockWriteGuard<MemTable>) {
         let mut full_maps = self.full_mem_tables.write().expect("RwLock poisoned");
-        let new_map = MemTable::new(map.config.clone());
+        let new_map = MemTable::new(
+            map.config.clone(),
+            self.age.fetch_add(1, Ordering::SeqCst) + 1,
+        );
         let old_map: MemTable = mem::replace(&mut (*map), new_map);
-        full_maps.push(Arc::new(old_map));
+        full_maps.insert(Arc::new(old_map));
     }
 
     fn insert<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, key: K, value: V) {
@@ -177,7 +187,10 @@ impl Database {
                 if mem_tables.is_empty() {
                     return;
                 }
-                (mem_tables.last().unwrap().clone(), mem_tables.len() - 1)
+                (
+                    mem_tables.iter().next().unwrap().clone(),
+                    mem_tables.len() - 1,
+                )
             };
 
             // Creating the disk table should not happen while list needed for gets are locked
@@ -185,29 +198,37 @@ impl Database {
                 self.new_sst().as_path(),
                 mem_table.iter(),
                 &self.config.disk_table_config,
+                mem_table.age,
             );
 
             // Lock both and swap
             let mut disk_tables = self.disk_tables.write().expect("RWLock poisoned");
             let mut mem_tables = self.full_mem_tables.write().expect("RWLock poisoned");
-            disk_tables.push(disk_table);
-            mem_tables.remove(mem_table_index);
+            disk_tables.insert(disk_table);
+            mem_tables.remove(&mem_table);
         }
     }
 
     fn compact(&self) {
         let mut disk_tables = self.disk_tables.write().expect("RWLock poisoned");
-        let iter = disk_tables.iter().map(|t| t.iter()).kmerge();
+        if disk_tables.len() == 0 {
+            return;
+        }
+        let iter = disk_tables
+            .iter()
+            .map(|t| t.iter())
+            .kmerge_join_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         let mut merged = DiskTable::create(
             self.new_sst().as_path(),
             iter,
             &self.config.disk_table_config,
+            disk_tables.iter().last().unwrap().age,
         );
-        for to_delete in disk_tables.iter_mut() {
+        for to_delete in disk_tables.iter() {
             to_delete.delete();
         }
         disk_tables.clear();
-        disk_tables.push(merged);
+        disk_tables.insert(merged);
     }
 }
 
@@ -237,6 +258,44 @@ mod tests {
         assert_eq!(
             db.get(key.as_bytes()).as_ref().map(|v| &(v[..])),
             Some(value.as_bytes())
+        );
+    }
+
+    #[test]
+    fn overwriting() {
+        let mut directory = PathBuf::new();
+        directory.push("test_db");
+        let db = Database::open_with_config(DatabaseConfig::default().directory(directory));
+        let key = String::from("key");
+
+        for v in 0..9 {
+            let value = v.to_string();
+            db.insert(key.as_bytes(), value.as_bytes());
+            db.flush();
+            assert_eq!(
+                db.get(key.as_bytes())
+                    .as_ref()
+                    .map(|v| String::from_utf8(v.to_vec()).unwrap()),
+                Some(value)
+            );
+        }
+
+        let value = 5.to_string();
+        db.insert(key.as_bytes(), value.as_bytes());
+        db.flush();
+        assert_eq!(
+            db.get(key.as_bytes())
+                .as_ref()
+                .map(|v| String::from_utf8(v.to_vec()).unwrap()),
+            Some(value.clone())
+        );
+
+        db.compact();
+        assert_eq!(
+            db.get(key.as_bytes())
+                .as_ref()
+                .map(|v| String::from_utf8(v.to_vec()).unwrap()),
+            Some(value)
         );
     }
 

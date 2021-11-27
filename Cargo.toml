@@ -8,5 +8,4 @@ edition = "2021"
 
 [dependencies]
 zstd = "0.8"
-itertools = "0.10"
 uuid = { version = "0.8", features = ["v4"] }
