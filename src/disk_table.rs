@@ -349,8 +349,6 @@ impl Entry<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use crate::disk_table::DiskTable;
     use crate::mem_table::MemTable;
     use crate::{DiskTableConfig, MemTableConfig};
@@ -365,9 +363,9 @@ mod tests {
             mem_table.insert(key.as_bytes(), value.as_bytes());
         }
 
-        let path = Path::new("test.sst");
+        let tmpdir = tempfile::tempdir().unwrap();
         let table = DiskTable::create(
-            path,
+            tmpdir.as_ref().join("test.sst").as_path(),
             mem_table.iter(),
             &DiskTableConfig::default().block_size(2_000),
             mem_table.age,

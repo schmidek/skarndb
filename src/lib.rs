@@ -298,7 +298,6 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::thread;
 
     use crate::{Database, DatabaseConfig, DiskTableConfig, MemTableConfig};
@@ -342,9 +341,9 @@ mod tests {
 
     #[test]
     fn remove_disk() {
-        let mut directory = PathBuf::new();
-        directory.push("test_db");
-        let db = Database::open_with_config(DatabaseConfig::default().directory(directory));
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db =
+            Database::open_with_config(DatabaseConfig::default().directory(tmpdir.into_path()));
         let key = String::from("key");
         let value = String::from("value");
         db.insert(key.as_bytes(), value.as_bytes());
@@ -381,9 +380,9 @@ mod tests {
 
     #[test]
     fn overwriting() {
-        let mut directory = PathBuf::new();
-        directory.push("test_db");
-        let db = Database::open_with_config(DatabaseConfig::default().directory(directory));
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db =
+            Database::open_with_config(DatabaseConfig::default().directory(tmpdir.into_path()));
         let key = String::from("key");
 
         for v in 0..9 {
@@ -466,13 +465,12 @@ mod tests {
     fn disk() {
         let mem_table_config = MemTableConfig::default().max_size(20);
         let disk_table_config = DiskTableConfig::default().block_size(1024);
-        let mut directory = PathBuf::new();
-        directory.push("test_db");
+        let tmpdir = tempfile::tempdir().unwrap();
         let db = Database::open_with_config(
             DatabaseConfig::default()
                 .mem_table_config(mem_table_config)
                 .disk_table_config(disk_table_config)
-                .directory(directory),
+                .directory(tmpdir.into_path()),
         );
 
         // Make sure compaction of empty db doesn't do anything
