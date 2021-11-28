@@ -9,3 +9,5 @@ edition = "2021"
 [dependencies]
 zstd = "0.8"
 uuid = { version = "0.8", features = ["v4"] }
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
