@@ -55,6 +55,6 @@ impl ObservableSet {
             }
             i += 1;
         }
-        values.retain(|x| x >= &(i-1));
+        values.retain(|x| x >= &(i - 1));
     }
 }

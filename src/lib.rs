@@ -169,30 +169,41 @@ impl Database {
         }
     }
 
+    pub fn remove<K: AsRef<[u8]>>(&self, key: K) -> Option<Box<[u8]>> {
+        let key_ref = key.as_ref();
+        let value = self.get(key_ref);
+        if value.is_some() {
+            self.insert(key_ref, vec![].into_boxed_slice());
+        }
+        value
+    }
+
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<Box<[u8]>> {
         let map = self.mem_table.read().expect("RwLock poisoned");
         let key_ref = key.as_ref();
-        map.get(key_ref).or_else(|| {
-            {
-                let full_maps = self.full_mem_tables.read().expect("RwLock poisoned");
-                for full_map in full_maps.iter() {
-                    let ret = full_map.get(key_ref);
-                    if ret.is_some() {
-                        return ret;
+        map.get(key_ref)
+            .or_else(|| {
+                {
+                    let full_maps = self.full_mem_tables.read().expect("RwLock poisoned");
+                    for full_map in full_maps.iter() {
+                        let ret = full_map.get(key_ref);
+                        if ret.is_some() {
+                            return ret;
+                        }
                     }
                 }
-            }
-            {
-                let disk_tables = self.disk_tables.read().expect("RwLock poisoned");
-                for disk_table in disk_tables.iter() {
-                    let ret = disk_table.get(key_ref);
-                    if ret.is_some() {
-                        return ret;
+                {
+                    let disk_tables = self.disk_tables.read().expect("RwLock poisoned");
+                    for disk_table in disk_tables.iter() {
+                        let ret = disk_table.get(key_ref);
+                        if ret.is_some() {
+                            return ret;
+                        }
                     }
                 }
-            }
-            None
-        })
+                None
+            })
+            .filter(|x| !x.is_empty())
     }
 
     fn is_read_only(&self) -> bool {
@@ -212,6 +223,7 @@ impl Database {
             mem_table.iter(),
             &self.config.disk_table_config,
             mem_table.age,
+            true,
         );
 
         // Lock both and swap
@@ -246,6 +258,9 @@ impl Database {
     }
 
     pub fn compact(&self) {
+        if self.is_read_only() {
+            return;
+        }
         let age_option = self.flush_internal();
         if age_option.is_none() {
             return;
@@ -268,6 +283,7 @@ impl Database {
             iter,
             &self.config.disk_table_config,
             age,
+            false,
         );
         drop(disk_tables);
 
@@ -307,6 +323,60 @@ mod tests {
             db.get(key.as_bytes()).as_ref().map(|v| &(v[..])),
             Some(value.as_bytes())
         );
+    }
+
+    #[test]
+    fn remove() {
+        let db = Database::open();
+        let key = String::from("key");
+        let value = String::from("value");
+        db.insert(key.as_bytes(), value.as_bytes());
+        assert_eq!(
+            db.get(key.as_bytes()).as_ref().map(|v| &(v[..])),
+            Some(value.as_bytes())
+        );
+        let removed = db.remove(key.as_bytes());
+        assert_eq!(removed.as_ref().map(|v| &(v[..])), Some(value.as_bytes()));
+        assert_eq!(db.get(key.as_bytes()).as_ref().map(|v| &(v[..])), None);
+    }
+
+    #[test]
+    fn remove_disk() {
+        let mut directory = PathBuf::new();
+        directory.push("test_db");
+        let db = Database::open_with_config(DatabaseConfig::default().directory(directory));
+        let key = String::from("key");
+        let value = String::from("value");
+        db.insert(key.as_bytes(), value.as_bytes());
+        assert_eq!(
+            db.get(key.as_bytes()).as_ref().map(|v| &(v[..])),
+            Some(value.as_bytes())
+        );
+
+        db.flush();
+
+        let removed = db.remove(key.as_bytes());
+        assert_eq!(removed.as_ref().map(|v| &(v[..])), Some(value.as_bytes()));
+        assert_eq!(db.get(key.as_bytes()).as_ref().map(|v| &(v[..])), None);
+
+        db.flush();
+
+        assert_eq!(db.get(key.as_bytes()).as_ref().map(|v| &(v[..])), None);
+
+        db.compact();
+
+        assert_eq!(db.get(key.as_bytes()).as_ref().map(|v| &(v[..])), None);
+
+        {
+            let disk_tables = db.disk_tables.read().expect("RWLock poisoned");
+            assert_eq!(disk_tables.len(), 1);
+            let disk_table = disk_tables.iter().next().unwrap();
+            // test that we didn't store the delete after compaction
+            assert_eq!(
+                disk_table.get(key.as_bytes()).as_ref().map(|v| &(v[..])),
+                None
+            );
+        }
     }
 
     #[test]

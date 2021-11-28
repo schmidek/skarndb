@@ -44,6 +44,7 @@ impl DiskTable {
         mut iter: I,
         disk_table_config: &DiskTableConfig,
         age: u64,
+        write_deletes: bool,
     ) -> DiskTable
     where
         I: Iterator<Item = (R, R)>,
@@ -81,25 +82,26 @@ impl DiskTable {
             // Create a block
             println!("Creating block");
             while let Some((key, value)) = next.as_ref() {
-                println!(
-                    "{} {}",
-                    String::from_utf8(key.as_ref().to_vec()).unwrap(),
-                    String::from_utf8(value.as_ref().to_vec()).unwrap()
-                );
-                let entry = Entry {
-                    key: key.as_ref(),
-                    value: value.as_ref(),
-                };
+                let value_ref = value.as_ref();
+                if write_deletes || !value_ref.is_empty() {
+                    let entry = Entry {
+                        key: key.as_ref(),
+                        value: value_ref,
+                    };
 
-                let space_left = buf.capacity() - buf.len();
-                if entry.len() > space_left {
-                    break; // this block is full
+                    let space_left = buf.capacity() - buf.len();
+                    if entry.len() > space_left {
+                        break; // this block is full
+                    }
+                    entry.write_to(&mut buf);
+
+                    prev = next;
                 }
-                println!("entry {} left:{}", entry.len(), space_left);
-                entry.write_to(&mut buf);
-
-                prev = next;
                 next = iter.next();
+            }
+
+            if prev.is_none() {
+                break; // block is empty
             }
 
             last_key = prev
@@ -337,9 +339,11 @@ impl Entry<'_> {
         buffer
             .write_all(&(self.value.len() as u64).to_le_bytes())
             .expect("Failed to write to buffer");
-        buffer
-            .write_all(self.value)
-            .expect("Failed to write to buffer");
+        if !self.value.is_empty() {
+            buffer
+                .write_all(self.value)
+                .expect("Failed to write to buffer");
+        }
     }
 }
 
@@ -367,6 +371,7 @@ mod tests {
             mem_table.iter(),
             &DiskTableConfig::default().block_size(2_000),
             mem_table.age,
+            true,
         );
 
         for i in 0..500 {
