@@ -1,23 +1,24 @@
+use core::mem;
+use std::collections::BTreeSet;
+use std::fs::create_dir_all;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
+use std::thread;
+
+use crossbeam_channel::{unbounded, Sender};
+use uuid::Uuid;
+
+use mem_table::MemTable;
+
+use crate::disk_table::DiskTable;
+use crate::kmerge_join::KMergeJoinBy;
+use crate::observable_set::ObservableSet;
+
 mod disk_table;
 mod kmerge_join;
 mod mem_table;
 mod observable_set;
-
-use std::collections::BTreeSet;
-
-use crate::disk_table::DiskTable;
-use crate::kmerge_join::KMergeJoinBy;
-use core::mem;
-
-use crate::observable_set::ObservableSet;
-use crossbeam_channel::{unbounded, Sender};
-use mem_table::MemTable;
-use std::fs::{create_dir_all, File};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
-use std::thread;
-use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct MemTableConfig {
@@ -141,7 +142,7 @@ impl Database {
         db
     }
 
-    fn swap_new_mem_table<'a>(&self, map: &mut RwLockWriteGuard<MemTable>) -> Arc<MemTable> {
+    fn swap_new_mem_table(&self, map: &mut RwLockWriteGuard<MemTable>) -> Arc<MemTable> {
         let mut full_maps = self.full_mem_tables.write().expect("RwLock poisoned");
         let new_map = MemTable::new(
             map.config.clone(),
@@ -151,7 +152,9 @@ impl Database {
         let old_map_arc = Arc::new(old_map);
         full_maps.insert(old_map_arc.clone());
         if !self.is_read_only() {
-            self.flushing_channel.send(old_map_arc.clone());
+            self.flushing_channel
+                .send(old_map_arc.clone())
+                .expect("Flushing channel broken");
         }
         old_map_arc
     }
@@ -169,29 +172,27 @@ impl Database {
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<Box<[u8]>> {
         let map = self.mem_table.read().expect("RwLock poisoned");
         let key_ref = key.as_ref();
-        map.get(key_ref)
-            .or_else(|| {
-                {
-                    let full_maps = self.full_mem_tables.read().expect("RwLock poisoned");
-                    for full_map in full_maps.iter() {
-                        let ret = full_map.get(key_ref);
-                        if ret.is_some() {
-                            return ret;
-                        }
+        map.get(key_ref).or_else(|| {
+            {
+                let full_maps = self.full_mem_tables.read().expect("RwLock poisoned");
+                for full_map in full_maps.iter() {
+                    let ret = full_map.get(key_ref);
+                    if ret.is_some() {
+                        return ret;
                     }
                 }
-                {
-                    let disk_tables = self.disk_tables.read().expect("RwLock poisoned");
-                    for disk_table in disk_tables.iter() {
-                        let ret = disk_table.get(key_ref);
-                        if ret.is_some() {
-                            return ret;
-                        }
+            }
+            {
+                let disk_tables = self.disk_tables.read().expect("RwLock poisoned");
+                for disk_table in disk_tables.iter() {
+                    let ret = disk_table.get(key_ref);
+                    if ret.is_some() {
+                        return ret;
                     }
                 }
-                None
-            })
-            .map(|v| v.clone())
+            }
+            None
+        })
     }
 
     fn is_read_only(&self) -> bool {
@@ -201,7 +202,7 @@ impl Database {
     fn new_sst(&self) -> PathBuf {
         let mut new_file = self.config.directory.clone().unwrap();
         new_file.push(Uuid::new_v4().to_string() + ".sst");
-        return new_file;
+        new_file
     }
 
     fn flush_mem_table(&self, mem_table: Arc<MemTable>) {
@@ -234,12 +235,10 @@ impl Database {
             let mut map = self.mem_table.write().expect("RwLock poisoned");
             if map.len() > 0 {
                 self.swap_new_mem_table(&mut map).age
+            } else if map.age == 0 {
+                return None;
             } else {
-                if map.age == 0 {
-                    return None;
-                } else {
-                    map.age - 1
-                }
+                map.age - 1
             }
         };
         self.finished_flushing.wait_for(age);
@@ -264,7 +263,7 @@ impl Database {
             .filter(|t| t.age <= age)
             .map(|t| t.iter())
             .kmerge_join_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        let mut merged = DiskTable::create(
+        let merged = DiskTable::create(
             self.new_sst().as_path(),
             iter,
             &self.config.disk_table_config,
@@ -283,10 +282,10 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use crate::{mem_table, Database, DatabaseConfig, DiskTableConfig, MemTableConfig};
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::path::PathBuf;
     use std::thread;
+
+    use crate::{Database, DatabaseConfig, DiskTableConfig, MemTableConfig};
 
     #[test]
     fn basic() {

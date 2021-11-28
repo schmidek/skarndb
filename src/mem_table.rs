@@ -1,7 +1,7 @@
-use crate::MemTableConfig;
 use std::cmp::Ordering;
-use std::collections::btree_map::Iter;
 use std::collections::BTreeMap;
+
+use crate::MemTableConfig;
 
 pub struct MemTable {
     pub config: MemTableConfig,
@@ -58,7 +58,7 @@ impl MemTable {
     }
 
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<Box<[u8]>> {
-        self.entries.get(key.as_ref()).map(|v| v.clone())
+        self.entries.get(key.as_ref()).cloned()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&Box<[u8]>, &Box<[u8]>)> {

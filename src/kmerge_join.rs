@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-use std::fmt;
 use std::iter::FusedIterator;
 use std::mem::replace;
 use std::vec::Vec;
@@ -120,6 +119,7 @@ where
 ///
 /// See [`.kmerge()`](crate::Itertools::kmerge) for more information.
 #[must_use = "iterator adaptors are lazy and do nothing unless consumed"]
+#[allow(dead_code)]
 pub type KMerge<I> = KMergeBy<I, KMergeByLt>;
 
 pub trait KMergePredicate<T> {
@@ -141,6 +141,7 @@ impl<T, F: FnMut(&T, &T) -> Ordering> KMergePredicate<T> for F {
     }
 }
 
+#[allow(dead_code)]
 pub fn kmerge<I>(iterable: I) -> KMerge<<I::Item as IntoIterator>::IntoIter>
 where
     I: IntoIterator,

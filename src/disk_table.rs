@@ -1,15 +1,13 @@
-use crate::mem_table::MemTable;
-use crate::{DiskTableConfig, MemTableConfig};
-use core::cmp;
-use std::borrow::Borrow;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+
 use zstd::block::{compress_to_buffer, decompress};
+
+use crate::DiskTableConfig;
 
 const U64_BYTES: usize = (u64::BITS / 8) as usize;
 
@@ -41,7 +39,7 @@ impl PartialEq for DiskTable {
 impl Eq for DiskTable {}
 
 impl DiskTable {
-    pub fn create<'a, I, R>(
+    pub fn create<I, R>(
         path: &Path,
         mut iter: I,
         disk_table_config: &DiskTableConfig,
@@ -64,7 +62,7 @@ impl DiskTable {
 
         let mut next = iter.next();
         let mut prev: Option<(R, R)> = None;
-        let mut block_offset = 0 as u64;
+        let mut block_offset = 0_u64;
 
         if next.is_none() {
             panic!("Tried to write empty MemTable");
@@ -73,37 +71,33 @@ impl DiskTable {
         let first_key = next
             .as_ref()
             .unwrap()
-            .clone()
             .0
             .as_ref()
             .to_vec()
             .into_boxed_slice();
-        let mut last_key = None;
+        let mut last_key;
 
         loop {
             // Create a block
             println!("Creating block");
-            loop {
-                if let Some((key, value)) = next.as_ref() {
-                    println!(
-                        "{} {}",
-                        String::from_utf8(key.as_ref().to_vec()).unwrap(),
-                        String::from_utf8(value.as_ref().to_vec()).unwrap()
-                    );
-                    let entry = Entry {
-                        key: key.as_ref(),
-                        value: value.as_ref(),
-                    };
+            while let Some((key, value)) = next.as_ref() {
+                println!(
+                    "{} {}",
+                    String::from_utf8(key.as_ref().to_vec()).unwrap(),
+                    String::from_utf8(value.as_ref().to_vec()).unwrap()
+                );
+                let entry = Entry {
+                    key: key.as_ref(),
+                    value: value.as_ref(),
+                };
 
-                    let space_left = buf.capacity() - buf.len();
-                    if entry.len() > space_left {
-                        break; // this block is full
-                    }
-                    println!("entry {} left:{}", entry.len(), space_left);
-                    entry.write_to(&mut buf);
-                } else {
-                    break; // finished
+                let space_left = buf.capacity() - buf.len();
+                if entry.len() > space_left {
+                    break; // this block is full
                 }
+                println!("entry {} left:{}", entry.len(), space_left);
+                entry.write_to(&mut buf);
+
                 prev = next;
                 next = iter.next();
             }
@@ -117,11 +111,12 @@ impl DiskTable {
                 match compress_to_buffer(&buf, &mut compressed_buf, 0) {
                     Ok(compressed_size) => {
                         println!("compressed len = {}", compressed_size);
-                        file.write_all(&compressed_buf[..compressed_size]);
+                        file.write_all(&compressed_buf[..compressed_size])
+                            .expect("Write failed");
                         (CompressionType::Zstd, compressed_size)
                     }
-                    Err(e) => {
-                        file.write_all(&buf);
+                    Err(_) => {
+                        file.write_all(&buf).expect("Write failed");
                         (CompressionType::None, buf.len())
                     }
                 };
@@ -160,12 +155,12 @@ impl DiskTable {
 
         println!("{} blocks", blocks.len());
 
-        return DiskTable {
+        DiskTable {
             file,
             path: path.to_path_buf(),
             blocks,
             age,
-        };
+        }
     }
 
     fn get_block_data(&self, block: &Block) -> Vec<u8> {
@@ -174,7 +169,7 @@ impl DiskTable {
             .read_exact_at(&mut buf, block.offset)
             .expect("Failed to read from file");
 
-        match (block.compression_type) {
+        match block.compression_type {
             CompressionType::None => buf,
             CompressionType::Zstd => decompress(&buf, usize::MAX).expect("Failed to decompress"),
         }
@@ -184,15 +179,11 @@ impl DiskTable {
         let key_ref = key.as_ref();
         // Find which block it could be in
         // TODO binary search
-        let block_search = self.blocks.iter().find(|&block| {
+        let block = self.blocks.iter().find(|&block| {
             key_ref.cmp(block.first_key.as_ref()).is_ge()
                 && key_ref.cmp(block.last_key.as_ref()).is_le()
-        });
-        if block_search.is_none() {
-            return None;
-        }
+        })?;
 
-        let block = block_search.unwrap();
         let block_data = self.get_block_data(block);
 
         println!("block size: {}", block_data.len());
@@ -229,7 +220,7 @@ impl DiskTable {
                 break;
             }
         }
-        return None;
+        None
     }
 
     pub fn iter(&self) -> Iter {
@@ -242,7 +233,7 @@ impl DiskTable {
     }
 
     pub fn delete(&self) {
-        fs::remove_file(self.path.as_path());
+        fs::remove_file(self.path.as_path()).expect("Remove file failed");
     }
 }
 
@@ -293,7 +284,7 @@ impl Iterator for Iter<'_> {
             self.position_in_block = 0;
             self.block_index += 1;
         }
-        return Some((key, value));
+        Some((key, value))
     }
 }
 
@@ -315,7 +306,7 @@ impl Block {
     fn write_to(&self, file: &mut File) {
         file.write_all(&((self.compression_type.clone() as u8).to_le_bytes()))
             .expect("Failed to write to file");
-        file.write_all(&(self.offset.clone().to_le_bytes()))
+        file.write_all(&(self.offset.to_le_bytes()))
             .expect("Failed to write to file");
         file.write_all(&((self.size as u64).to_le_bytes()))
             .expect("Failed to write to file");
@@ -337,11 +328,15 @@ impl Entry<'_> {
     }
 
     fn write_to(&self, buffer: &mut Vec<u8>) {
-        buffer.write_all(&(self.key.len() as u64).to_le_bytes());
+        buffer
+            .write_all(&(self.key.len() as u64).to_le_bytes())
+            .expect("Failed to write to buffer");
         buffer
             .write_all(self.key)
             .expect("Failed to write to buffer");
-        buffer.write_all(&(self.value.len() as u64).to_le_bytes());
+        buffer
+            .write_all(&(self.value.len() as u64).to_le_bytes())
+            .expect("Failed to write to buffer");
         buffer
             .write_all(self.value)
             .expect("Failed to write to buffer");
@@ -350,10 +345,11 @@ impl Entry<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use crate::disk_table::DiskTable;
     use crate::mem_table::MemTable;
     use crate::{DiskTableConfig, MemTableConfig};
-    use std::path::Path;
 
     #[test]
     fn write() {

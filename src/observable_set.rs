@@ -1,6 +1,7 @@
-use crossbeam_utils::sync::{Parker, Unparker};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::RwLock;
+
+use crossbeam_utils::sync::{Parker, Unparker};
 
 pub struct ObservableSet {
     // the first value means the set contains all numbers up to and including that number
@@ -26,10 +27,7 @@ impl ObservableSet {
                 return;
             }
             let mut observers = self.observers.write().expect("RwLock poisoned");
-            if !observers.contains_key(&value) {
-                observers.insert(value, Vec::new());
-            }
-            observers.get_mut(&value).unwrap().push(u);
+            observers.entry(value).or_insert_with(Vec::new).push(u);
         }
         p.park();
     }
