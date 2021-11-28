@@ -26,6 +26,7 @@ impl ObservableSet {
             if !values.is_empty() && values.iter().next().unwrap() >= &value {
                 return;
             }
+            // We need to hold onto the values read lock until we add our observer to make sure it doesn't get written to in the meantime
             let mut observers = self.observers.write().expect("RwLock poisoned");
             observers.entry(value).or_insert_with(Vec::new).push(u);
         }
@@ -35,23 +36,25 @@ impl ObservableSet {
     pub fn add(&self, value: u64) {
         let mut values = self.values.write().expect("RwLock poisoned");
         let next_number = values.iter().next().map(|x| x + 1).unwrap_or(0);
+        values.insert(value);
         for i in next_number..value {
             if !values.contains(&i) {
-                values.insert(value);
                 return;
             }
         }
         // notify any observers
         let mut observers = self.observers.write().expect("RwLock poisoned");
-        for i in next_number..=value {
+        // We have at least up to value but could be more
+        let mut i = next_number;
+        while values.contains(&i) {
             if let Some(i_observers) = observers.get(&i) {
                 for i_observer in i_observers {
                     i_observer.unpark();
                 }
                 observers.remove(&i);
             }
+            i += 1;
         }
-        values.retain(|x| x > &value);
-        values.insert(value);
+        values.retain(|x| x >= &(i-1));
     }
 }
