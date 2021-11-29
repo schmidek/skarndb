@@ -62,6 +62,7 @@ pub struct DatabaseConfig {
     pub disk_table_config: DiskTableConfig,
     pub directory: Option<PathBuf>,
     pub num_flushing_threads: usize,
+    pub max_mem_tables: usize,
 }
 
 impl DatabaseConfig {
@@ -71,6 +72,7 @@ impl DatabaseConfig {
             disk_table_config: DiskTableConfig::default(),
             directory: None,
             num_flushing_threads: 2,
+            max_mem_tables: 10,
         }
     }
 
@@ -91,6 +93,11 @@ impl DatabaseConfig {
 
     pub fn num_flushing_threads(mut self, num_flushing_threads: usize) -> Self {
         self.num_flushing_threads = num_flushing_threads;
+        self
+    }
+
+    pub fn max_mem_tables(mut self, max_mem_tables: usize) -> Self {
+        self.max_mem_tables = max_mem_tables;
         self
     }
 }
@@ -166,6 +173,12 @@ impl Database {
 
     fn swap_new_mem_table(&self, map: &mut RwLockWriteGuard<MemTable>) -> Arc<MemTable> {
         let mut full_maps = self.full_mem_tables.write().expect("RwLock poisoned");
+        // If we have too many mem tables we need to wait for at least one to have been written
+        while full_maps.len() >= self.config.max_mem_tables {
+            drop(full_maps);
+            self.finished_flushing.wait_for_any();
+            full_maps = self.full_mem_tables.write().expect("RwLock poisoned");
+        }
         let new_map = MemTable::new(
             map.config.clone(),
             self.age.fetch_add(1, Ordering::SeqCst) + 1,
@@ -482,7 +495,7 @@ mod tests {
 
     #[test]
     fn overflow_mem_table() {
-        let mem_table_config = MemTableConfig::default().max_size(20);
+        let mem_table_config = MemTableConfig::default().max_size(200);
         let db = Database::open_with_config(
             DatabaseConfig::default().mem_table_config(mem_table_config),
         );

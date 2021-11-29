@@ -3,6 +3,8 @@ use std::sync::RwLock;
 
 use crossbeam_utils::sync::{Parker, Unparker};
 
+const ANY: u64 = u64::MAX;
+
 pub struct ObservableSet {
     // the first value means the set contains all numbers up to and including that number
     values: RwLock<BTreeSet<u64>>,
@@ -42,6 +44,10 @@ impl ObservableSet {
         p.park();
     }
 
+    pub fn wait_for_any(&self) {
+        self.wait_for(ANY);
+    }
+
     pub fn add(&self, value: u64) {
         let mut values = self.values.write().expect("RwLock poisoned");
         let next_number = values.iter().next().map(|x| x + 1).unwrap_or(0);
@@ -56,14 +62,19 @@ impl ObservableSet {
         // We have at least up to value but could be more
         let mut i = next_number;
         while values.contains(&i) {
-            if let Some(i_observers) = observers.get(&i) {
+            if let Some(i_observers) = observers.remove(&i) {
                 for i_observer in i_observers {
                     i_observer.unpark();
                 }
-                observers.remove(&i);
             }
             i += 1;
         }
         values.retain(|x| x >= &(i - 1));
+
+        if let Some(any_observers) = observers.remove(&ANY) {
+            for observer in any_observers {
+                observer.unpark();
+            }
+        }
     }
 }
