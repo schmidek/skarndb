@@ -4,7 +4,7 @@ use std::fs::create_dir_all;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
-use std::thread;
+use std::{fs, thread};
 
 use crossbeam_channel::{unbounded, Sender};
 use uuid::Uuid;
@@ -112,19 +112,41 @@ impl Database {
     }
 
     pub fn open_with_config(config: DatabaseConfig) -> Arc<Database> {
+        let mut disk_tables = BTreeSet::new();
+        let mut age = 0;
+        if let Some(directory) = config.directory.clone() {
+            // Look for existing .sst files
+            let files = fs::read_dir(directory.as_path()).unwrap();
+            files.filter_map(|f| f.ok()).for_each(|f| {
+                if f.path().extension().and_then(|s| s.to_str()) == Some("sst") {
+                    let disk_table = DiskTable::open(f.path().as_path()).unwrap();
+                    if disk_table.age >= age {
+                        age = disk_table.age + 1;
+                    }
+                    disk_tables.insert(disk_table);
+                }
+            });
+        }
+        let finished_flushing = if age > 0 {
+            ObservableSet::new_with_value(age - 1)
+        } else {
+            ObservableSet::new()
+        };
+
         let (sender, receiver) = unbounded();
         let db = Arc::new(Database {
-            mem_table: RwLock::new(MemTable::new(config.mem_table_config.clone(), 0)),
+            mem_table: RwLock::new(MemTable::new(config.mem_table_config.clone(), age)),
             full_mem_tables: RwLock::new(BTreeSet::new()),
-            disk_tables: RwLock::new(BTreeSet::new()),
+            disk_tables: RwLock::new(disk_tables),
             compaction_lock: Mutex::new(0),
             config,
-            age: AtomicU64::new(0),
+            age: AtomicU64::new(age),
             flushing_channel: sender,
-            finished_flushing: ObservableSet::new(),
+            finished_flushing,
         });
         // Create directory
         if !db.is_read_only() {
+            // Create directory if needed
             create_dir_all(db.config.directory.clone().unwrap().as_path())
                 .expect("Failed to create dirs");
         }
@@ -381,8 +403,9 @@ mod tests {
     #[test]
     fn overwriting() {
         let tmpdir = tempfile::tempdir().unwrap();
-        let db =
-            Database::open_with_config(DatabaseConfig::default().directory(tmpdir.into_path()));
+        let db = Database::open_with_config(
+            DatabaseConfig::default().directory(tmpdir.path().to_path_buf()),
+        );
         let key = String::from("key");
 
         for v in 0..9 {
@@ -398,6 +421,28 @@ mod tests {
         }
 
         let value = 5.to_string();
+        db.insert(key.as_bytes(), value.as_bytes());
+        db.flush();
+        assert_eq!(
+            db.get(key.as_bytes())
+                .as_ref()
+                .map(|v| String::from_utf8(v.to_vec()).unwrap()),
+            Some(value.clone())
+        );
+
+        db.compact();
+        assert_eq!(
+            db.get(key.as_bytes())
+                .as_ref()
+                .map(|v| String::from_utf8(v.to_vec()).unwrap()),
+            Some(value)
+        );
+        drop(db);
+
+        let db = Database::open_with_config(
+            DatabaseConfig::default().directory(tmpdir.path().to_path_buf()),
+        );
+        let value = 6.to_string();
         db.insert(key.as_bytes(), value.as_bytes());
         db.flush();
         assert_eq!(
@@ -470,7 +515,7 @@ mod tests {
             DatabaseConfig::default()
                 .mem_table_config(mem_table_config)
                 .disk_table_config(disk_table_config)
-                .directory(tmpdir.into_path()),
+                .directory(tmpdir.path().to_path_buf()),
         );
 
         // Make sure compaction of empty db doesn't do anything
@@ -522,6 +567,19 @@ mod tests {
         assert_eq!(
             db.get(first_key.as_bytes()).as_ref().map(|v| &(v[..])),
             Some(first_value.as_bytes())
+        );
+        for i in 0..100 {
+            let key = format!("key{}", i);
+            let value = format!("value{}", i);
+            assert_eq!(
+                db.get(key.as_bytes()).as_ref().map(|v| &(v[..])),
+                Some(value.as_bytes())
+            );
+        }
+
+        drop(db);
+        let db = Database::open_with_config(
+            DatabaseConfig::default().directory(tmpdir.path().to_path_buf()),
         );
         for i in 0..100 {
             let key = format!("key{}", i);

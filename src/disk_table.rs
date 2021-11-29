@@ -1,9 +1,9 @@
 use std::cmp::Ordering;
-use std::fs;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 use zstd::block::{compress_to_buffer, decompress};
 
@@ -39,6 +39,44 @@ impl PartialEq for DiskTable {
 impl Eq for DiskTable {}
 
 impl DiskTable {
+    pub fn open(path: &Path) -> io::Result<DiskTable> {
+        let mut file = File::open(path).expect("TODO handle file failed to create");
+
+        // Read blocks
+        let mut blocks = Vec::new();
+
+        let mut buf = [0; U64_BYTES];
+        let mut index = file.seek(SeekFrom::End(0))?;
+        println!("end position {}", index);
+
+        index -= U64_BYTES as u64;
+        file.read_exact_at(&mut buf, index)?;
+        let age = u64::from_le_bytes(buf);
+        println!("age = {}", age);
+
+        index -= U64_BYTES as u64;
+        file.read_exact_at(&mut buf, index)?;
+        let num_blocks = u64::from_le_bytes(buf);
+        println!("num_blocks = {}", num_blocks);
+
+        index -= U64_BYTES as u64;
+        file.read_exact_at(&mut buf, index)?;
+        let starting_block_position = u64::from_le_bytes(buf);
+        println!("starting_block_position = {}", starting_block_position);
+
+        file.seek(SeekFrom::Start(starting_block_position))?;
+        for _ in 0..num_blocks {
+            blocks.push(Block::read_from(&mut file)?);
+        }
+
+        Ok(DiskTable {
+            file,
+            path: path.to_path_buf(),
+            blocks,
+            age,
+        })
+    }
+
     pub fn create<I, R>(
         path: &Path,
         mut iter: I,
@@ -138,10 +176,19 @@ impl DiskTable {
             }
         }
 
+        let starting_block_position = file
+            .seek(SeekFrom::Current(0))
+            .expect("Failed to get position");
+
         // Write blocks
         for block in &blocks {
             block.write_to(&mut file);
         }
+
+        // Write starting block position
+        file.write_all(&(starting_block_position.to_le_bytes()))
+            .expect("Failed to write to file");
+
         // Write number of blocks
         file.write_all(&((blocks.len() as u64).to_le_bytes()))
             .expect("Failed to write to file");
@@ -187,8 +234,6 @@ impl DiskTable {
         })?;
 
         let block_data = self.get_block_data(block);
-
-        println!("block size: {}", block_data.len());
 
         let mut index = 0;
         loop {
@@ -296,6 +341,16 @@ enum CompressionType {
     Zstd,
 }
 
+impl CompressionType {
+    fn from(n: u8) -> Option<CompressionType> {
+        match n {
+            0 => Some(CompressionType::None),
+            1 => Some(CompressionType::Zstd),
+            _ => None,
+        }
+    }
+}
+
 struct Block {
     compression_type: CompressionType,
     offset: u64,
@@ -305,6 +360,46 @@ struct Block {
 }
 
 impl Block {
+    fn read_from(file: &mut File) -> io::Result<Block> {
+        let compression_type = {
+            let mut buf = [0; 1];
+            file.read_exact(&mut buf)?;
+            CompressionType::from(u8::from_le_bytes(buf)).expect("Unknown compression type")
+        };
+
+        let mut buf = [0; U64_BYTES];
+
+        file.read_exact(&mut buf)?;
+        let offset = u64::from_le_bytes(buf);
+
+        file.read_exact(&mut buf)?;
+        let size = u64::from_le_bytes(buf) as usize;
+
+        file.read_exact(&mut buf)?;
+        let first_key_size = u64::from_le_bytes(buf) as usize;
+        println!("first_key_size = {}", first_key_size);
+        let mut first_key = vec![0; first_key_size];
+        file.read_exact(&mut first_key)?;
+        println!(
+            "first_key = {}",
+            String::from_utf8(first_key.clone()).unwrap()
+        );
+
+        file.read_exact(&mut buf)?;
+        let last_key_size = u64::from_le_bytes(buf) as usize;
+        println!("last_key_size = {}", last_key_size);
+        let mut last_key = vec![0; last_key_size];
+        file.read_exact(&mut last_key)?;
+
+        Ok(Block {
+            compression_type,
+            offset,
+            size,
+            first_key: first_key.into_boxed_slice(),
+            last_key: last_key.into_boxed_slice(),
+        })
+    }
+
     fn write_to(&self, file: &mut File) {
         file.write_all(&((self.compression_type.clone() as u8).to_le_bytes()))
             .expect("Failed to write to file");
@@ -312,7 +407,11 @@ impl Block {
             .expect("Failed to write to file");
         file.write_all(&((self.size as u64).to_le_bytes()))
             .expect("Failed to write to file");
+        file.write_all(&((self.first_key.len() as u64).to_le_bytes()))
+            .expect("Failed to write to file");
         file.write_all(&*self.first_key)
+            .expect("Failed to write to file");
+        file.write_all(&((self.last_key.len() as u64).to_le_bytes()))
             .expect("Failed to write to file");
         file.write_all(&*self.last_key)
             .expect("Failed to write to file");

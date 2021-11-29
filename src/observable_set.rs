@@ -17,6 +17,15 @@ impl ObservableSet {
         }
     }
 
+    pub fn new_with_value(value: u64) -> ObservableSet {
+        let mut values = BTreeSet::new();
+        values.insert(value);
+        ObservableSet {
+            values: RwLock::new(values),
+            observers: RwLock::new(BTreeMap::new()),
+        }
+    }
+
     /// Wait for set to contain all numbers up to and including value
     pub fn wait_for(&self, value: u64) {
         let p = Parker::new();
