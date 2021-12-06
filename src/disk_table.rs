@@ -1,12 +1,13 @@
 use std::cmp::Ordering;
+use std::fs;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::{fs, io};
 
 use zstd::block::{compress_to_buffer, decompress};
 
+use crate::error::Result;
 use crate::DiskTableConfig;
 
 const U64_BYTES: usize = (u64::BITS / 8) as usize;
@@ -39,7 +40,7 @@ impl PartialEq for DiskTable {
 impl Eq for DiskTable {}
 
 impl DiskTable {
-    pub fn open(path: &Path) -> io::Result<DiskTable> {
+    pub fn open(path: &Path) -> Result<DiskTable> {
         let mut file = File::open(path).expect("TODO handle file failed to create");
 
         // Read blocks
@@ -83,12 +84,12 @@ impl DiskTable {
         disk_table_config: &DiskTableConfig,
         age: u64,
         write_deletes: bool,
-    ) -> DiskTable
+    ) -> Result<DiskTable>
     where
         I: Iterator<Item = (R, R)>,
         R: AsRef<[u8]>,
     {
-        let mut file = File::create(path).expect("TODO handle file failed to create");
+        let mut file = File::create(path)?;
 
         // Create blocks
         let mut blocks = Vec::new();
@@ -100,7 +101,7 @@ impl DiskTable {
         let mut compressed_buf = Vec::with_capacity(max_compressed_len);
 
         let mut next = iter.next();
-        let mut prev: Option<(R, R)> = None;
+        let mut prev: Option<(R, R)>;
         let mut block_offset = 0_u64;
 
         if next.is_none() {
@@ -119,6 +120,7 @@ impl DiskTable {
         loop {
             // Create a block
             println!("Creating block");
+            prev = None;
             while let Some((key, value)) = next.as_ref() {
                 let value_ref = value.as_ref();
                 if write_deletes || !value_ref.is_empty() {
@@ -128,10 +130,11 @@ impl DiskTable {
                     };
 
                     let space_left = buf.capacity() - buf.len();
-                    if entry.len() > space_left {
+                    if prev.is_some() /* must have written at least 1 entry */ && entry.len() > space_left
+                    {
                         break; // this block is full
                     }
-                    entry.write_to(&mut buf);
+                    entry.write_to(&mut buf)?;
 
                     prev = next;
                 }
@@ -176,64 +179,62 @@ impl DiskTable {
             }
         }
 
-        let starting_block_position = file
-            .seek(SeekFrom::Current(0))
-            .expect("Failed to get position");
+        let starting_block_position = file.seek(SeekFrom::Current(0))?;
 
         // Write blocks
         for block in &blocks {
-            block.write_to(&mut file);
+            block.write_to(&mut file)?;
         }
 
         // Write starting block position
-        file.write_all(&(starting_block_position.to_le_bytes()))
-            .expect("Failed to write to file");
+        file.write_all(&(starting_block_position.to_le_bytes()))?;
 
         // Write number of blocks
-        file.write_all(&((blocks.len() as u64).to_le_bytes()))
-            .expect("Failed to write to file");
+        file.write_all(&((blocks.len() as u64).to_le_bytes()))?;
 
         // Write age
-        file.write_all(&(age.to_le_bytes()))
-            .expect("Failed to write to file");
+        file.write_all(&(age.to_le_bytes()))?;
 
         // Flush then reopen readonly
-        file.flush().expect("Failed flush");
+        file.flush()?;
         drop(file);
-        let file = File::open(path).expect("TODO handle file failed to open");
+        let file = File::open(path)?;
 
         println!("{} blocks", blocks.len());
 
-        DiskTable {
+        Ok(DiskTable {
             file,
             path: path.to_path_buf(),
             blocks,
             age,
-        }
+        })
     }
 
-    fn get_block_data(&self, block: &Block) -> Vec<u8> {
+    fn get_block_data(&self, block: &Block) -> Result<Vec<u8>> {
         let mut buf = vec![0; block.size];
-        self.file
-            .read_exact_at(&mut buf, block.offset)
-            .expect("Failed to read from file");
+        self.file.read_exact_at(&mut buf, block.offset)?;
 
-        match block.compression_type {
+        Ok(match block.compression_type {
             CompressionType::None => buf,
             CompressionType::Zstd => decompress(&buf, usize::MAX).expect("Failed to decompress"),
-        }
+        })
     }
 
-    pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<Box<[u8]>> {
+    pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<Box<[u8]>>> {
         let key_ref = key.as_ref();
         // Find which block it could be in
         // TODO binary search
-        let block = self.blocks.iter().find(|&block| {
+        let block_search = self.blocks.iter().find(|&block| {
             key_ref.cmp(block.first_key.as_ref()).is_ge()
                 && key_ref.cmp(block.last_key.as_ref()).is_le()
-        })?;
+        });
 
-        let block_data = self.get_block_data(block);
+        if block_search.is_none() {
+            return Ok(None);
+        }
+
+        let block = block_search.unwrap();
+        let block_data = self.get_block_data(block)?;
 
         let mut index = 0;
         loop {
@@ -254,11 +255,11 @@ impl DiskTable {
             index += U64_BYTES;
 
             if key_matches {
-                return Some(
+                return Ok(Some(
                     block_data[index..index + value_size as usize]
                         .to_vec()
                         .into_boxed_slice(),
-                );
+                ));
             }
 
             index += value_size as usize;
@@ -267,7 +268,7 @@ impl DiskTable {
                 break;
             }
         }
-        None
+        Ok(None)
     }
 
     pub fn iter(&self) -> Iter {
@@ -301,7 +302,7 @@ impl Iterator for Iter<'_> {
             }
             let block = &self.table.blocks[self.block_index];
             let block_data = self.table.get_block_data(block);
-            self.block_data = Some(block_data);
+            self.block_data = Some(block_data.unwrap());
         }
         let block_data = self.block_data.as_ref().unwrap();
 
@@ -360,7 +361,7 @@ struct Block {
 }
 
 impl Block {
-    fn read_from(file: &mut File) -> io::Result<Block> {
+    fn read_from(file: &mut File) -> Result<Block> {
         let compression_type = {
             let mut buf = [0; 1];
             file.read_exact(&mut buf)?;
@@ -400,21 +401,15 @@ impl Block {
         })
     }
 
-    fn write_to(&self, file: &mut File) {
-        file.write_all(&((self.compression_type.clone() as u8).to_le_bytes()))
-            .expect("Failed to write to file");
-        file.write_all(&(self.offset.to_le_bytes()))
-            .expect("Failed to write to file");
-        file.write_all(&((self.size as u64).to_le_bytes()))
-            .expect("Failed to write to file");
-        file.write_all(&((self.first_key.len() as u64).to_le_bytes()))
-            .expect("Failed to write to file");
-        file.write_all(&*self.first_key)
-            .expect("Failed to write to file");
-        file.write_all(&((self.last_key.len() as u64).to_le_bytes()))
-            .expect("Failed to write to file");
-        file.write_all(&*self.last_key)
-            .expect("Failed to write to file");
+    fn write_to(&self, file: &mut File) -> Result<()> {
+        file.write_all(&((self.compression_type.clone() as u8).to_le_bytes()))?;
+        file.write_all(&(self.offset.to_le_bytes()))?;
+        file.write_all(&((self.size as u64).to_le_bytes()))?;
+        file.write_all(&((self.first_key.len() as u64).to_le_bytes()))?;
+        file.write_all(&*self.first_key)?;
+        file.write_all(&((self.last_key.len() as u64).to_le_bytes()))?;
+        file.write_all(&*self.last_key)?;
+        Ok(())
     }
 }
 
@@ -428,21 +423,14 @@ impl Entry<'_> {
         self.key.len() + self.value.len() + 8
     }
 
-    fn write_to(&self, buffer: &mut Vec<u8>) {
-        buffer
-            .write_all(&(self.key.len() as u64).to_le_bytes())
-            .expect("Failed to write to buffer");
-        buffer
-            .write_all(self.key)
-            .expect("Failed to write to buffer");
-        buffer
-            .write_all(&(self.value.len() as u64).to_le_bytes())
-            .expect("Failed to write to buffer");
+    fn write_to(&self, buffer: &mut Vec<u8>) -> Result<()> {
+        buffer.write_all(&(self.key.len() as u64).to_le_bytes())?;
+        buffer.write_all(self.key)?;
+        buffer.write_all(&(self.value.len() as u64).to_le_bytes())?;
         if !self.value.is_empty() {
-            buffer
-                .write_all(self.value)
-                .expect("Failed to write to buffer");
+            buffer.write_all(self.value)?;
         }
+        Ok(())
     }
 }
 
@@ -459,7 +447,7 @@ mod tests {
         for i in 0..500 {
             let key = format!("key{}", i);
             let value = format!("value{}", i);
-            mem_table.insert(key.as_bytes(), value.as_bytes());
+            mem_table.insert(key.as_bytes(), value.as_bytes()).unwrap();
         }
 
         let tmpdir = tempfile::tempdir().unwrap();
@@ -469,12 +457,13 @@ mod tests {
             &DiskTableConfig::default().block_size(2_000),
             mem_table.age,
             true,
-        );
+        )
+        .unwrap();
 
         for i in 0..500 {
             let key = format!("key{}", i);
             let expected_value = format!("value{}", i);
-            let value = table.get(key.as_bytes());
+            let value = table.get(key.as_bytes()).unwrap();
 
             assert_eq!(
                 value.as_ref().map(|v| v.as_ref()),
@@ -484,7 +473,7 @@ mod tests {
 
         for i in 501..600 {
             let key = format!("key{}", i);
-            let value = table.get(key.as_bytes());
+            let value = table.get(key.as_bytes()).unwrap();
 
             assert_eq!(value.as_ref().map(|v| v.as_ref()), None);
         }

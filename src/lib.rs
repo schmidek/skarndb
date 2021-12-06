@@ -9,6 +9,7 @@ use std::{fs, thread};
 use crossbeam_channel::{unbounded, Sender};
 use uuid::Uuid;
 
+use error::Result;
 use mem_table::MemTable;
 
 use crate::disk_table::DiskTable;
@@ -16,6 +17,7 @@ use crate::kmerge_join::KMergeJoinBy;
 use crate::observable_set::ObservableSet;
 
 mod disk_table;
+pub mod error;
 mod kmerge_join;
 mod mem_table;
 mod observable_set;
@@ -114,25 +116,26 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn open() -> Arc<Database> {
+    pub fn open() -> Result<Arc<Database>> {
         Database::open_with_config(DatabaseConfig::default())
     }
 
-    pub fn open_with_config(config: DatabaseConfig) -> Arc<Database> {
+    pub fn open_with_config(config: DatabaseConfig) -> Result<Arc<Database>> {
         let mut disk_tables = BTreeSet::new();
         let mut age = 0;
         if let Some(directory) = config.directory.clone() {
             // Look for existing .sst files
-            let files = fs::read_dir(directory.as_path()).unwrap();
-            files.filter_map(|f| f.ok()).for_each(|f| {
-                if f.path().extension().and_then(|s| s.to_str()) == Some("sst") {
-                    let disk_table = DiskTable::open(f.path().as_path()).unwrap();
-                    if disk_table.age >= age {
-                        age = disk_table.age + 1;
+            if let Ok(files) = fs::read_dir(directory.as_path()) {
+                files.filter_map(|f| f.ok()).for_each(|f| {
+                    if f.path().extension().and_then(|s| s.to_str()) == Some("sst") {
+                        let disk_table = DiskTable::open(f.path().as_path()).unwrap();
+                        if disk_table.age >= age {
+                            age = disk_table.age + 1;
+                        }
+                        disk_tables.insert(disk_table);
                     }
-                    disk_tables.insert(disk_table);
-                }
-            });
+                });
+            }
         }
         let finished_flushing = if age > 0 {
             ObservableSet::new_with_value(age - 1)
@@ -154,8 +157,7 @@ impl Database {
         // Create directory
         if !db.is_read_only() {
             // Create directory if needed
-            create_dir_all(db.config.directory.clone().unwrap().as_path())
-                .expect("Failed to create dirs");
+            create_dir_all(db.config.directory.clone().unwrap().as_path())?;
         }
         for _ in 0..db.config.num_flushing_threads {
             let r = receiver.clone();
@@ -168,7 +170,7 @@ impl Database {
                 db_ref.flush_mem_table(result.unwrap());
             });
         }
-        db
+        Ok(db)
     }
 
     fn swap_new_mem_table(&self, map: &mut RwLockWriteGuard<MemTable>) -> Arc<MemTable> {
@@ -194,23 +196,24 @@ impl Database {
         old_map_arc
     }
 
-    pub fn insert<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, key: K, value: V) {
+    pub fn insert<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, key: K, value: V) -> Result<()> {
         let mut map = self.mem_table.write().expect("RwLock poisoned");
         while !map.insert(
             key.as_ref().to_vec().into_boxed_slice(),
             value.as_ref().to_vec().into_boxed_slice(),
-        ) {
+        )? {
             self.swap_new_mem_table(&mut map);
         }
+        Ok(())
     }
 
-    pub fn remove<K: AsRef<[u8]>>(&self, key: K) -> Option<Box<[u8]>> {
+    pub fn remove<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<Box<[u8]>>> {
         let key_ref = key.as_ref();
         let value = self.get(key_ref);
         if value.is_some() {
-            self.insert(key_ref, vec![].into_boxed_slice());
+            self.insert(key_ref, vec![].into_boxed_slice())?;
         }
-        value
+        Ok(value)
     }
 
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<Box<[u8]>> {
@@ -230,7 +233,11 @@ impl Database {
                 {
                     let disk_tables = self.disk_tables.read().expect("RwLock poisoned");
                     for disk_table in disk_tables.iter() {
-                        let ret = disk_table.get(key_ref);
+                        let res = disk_table.get(key_ref);
+                        if res.is_err() {
+                            return None;
+                        }
+                        let ret = res.unwrap();
                         if ret.is_some() {
                             return ret;
                         }
@@ -259,7 +266,8 @@ impl Database {
             &self.config.disk_table_config,
             mem_table.age,
             true,
-        );
+        )
+        .expect("Failed to create DiskTable");
 
         // Lock both and swap
         let mut disk_tables = self.disk_tables.write().expect("RWLock poisoned");
@@ -319,7 +327,8 @@ impl Database {
             &self.config.disk_table_config,
             age,
             false,
-        );
+        )
+        .expect("Failed to create DiskTable");
         drop(disk_tables);
 
         let mut disk_tables = self.disk_tables.write().expect("RWLock poisoned");
@@ -339,20 +348,20 @@ mod tests {
 
     #[test]
     fn basic() {
-        let db = Database::open();
+        let db = Database::open().unwrap();
         let key = vec![8];
         let value = vec![9, 10];
-        db.insert(&key, &value);
+        db.insert(&key, &value).unwrap();
         let retrieved_value = db.get(&key);
         assert_eq!(retrieved_value.as_ref().map(|v| &v[..]), Some(&value[..]));
     }
 
     #[test]
     fn basic_strings() {
-        let db = Database::open();
+        let db = Database::open().unwrap();
         let key = String::from("key");
         let value = String::from("value");
-        db.insert(key.as_bytes(), value.as_bytes());
+        db.insert(key.as_bytes(), value.as_bytes()).unwrap();
         assert_eq!(
             db.get(key.as_bytes()).as_ref().map(|v| &(v[..])),
             Some(value.as_bytes())
@@ -360,16 +369,64 @@ mod tests {
     }
 
     #[test]
+    fn write_too_large() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let mem_table_config = MemTableConfig::default().max_size(20);
+        let disk_table_config = DiskTableConfig::default().block_size(15);
+        let db = Database::open_with_config(
+            DatabaseConfig::default()
+                .mem_table_config(mem_table_config)
+                .disk_table_config(disk_table_config)
+                .directory(tmpdir.into_path()),
+        )
+        .unwrap();
+
+        // Test a write larger than the mem table max, this should return an error
+        let key = String::from("key");
+        let value = String::from("value larger than mem table size");
+        let result = db.insert(key.as_bytes(), value.as_bytes());
+        assert!(result.is_err());
+
+        assert_eq!(
+            db.get(key.as_bytes())
+                .as_ref()
+                .map(|v| String::from_utf8(v.to_vec()).unwrap()),
+            None
+        );
+
+        // Test a write larger than block size but smaller than mem table max
+        let key = String::from("key");
+        let value = String::from("value larger ");
+        let result = db.insert(key.as_bytes(), value.as_bytes());
+        assert!(result.is_ok());
+
+        db.flush();
+        {
+            let disk_tables = db.disk_tables.read().expect("RWLock poisoned");
+            assert_eq!(disk_tables.len(), 1);
+        }
+
+        assert_eq!(
+            db.get(key.as_bytes())
+                .as_ref()
+                .map(|v| String::from_utf8(v.to_vec()).unwrap()),
+            Some(value.clone())
+        );
+    }
+
+    #[test]
     fn remove() {
-        let db = Database::open();
+        let db = Database::open().unwrap();
         let key = String::from("key");
         let value = String::from("value");
-        db.insert(key.as_bytes(), value.as_bytes());
+        db.insert(key.as_bytes(), value.as_bytes()).unwrap();
         assert_eq!(
             db.get(key.as_bytes()).as_ref().map(|v| &(v[..])),
             Some(value.as_bytes())
         );
-        let removed = db.remove(key.as_bytes());
+        let removed_result = db.remove(key.as_bytes());
+        assert!(removed_result.is_ok());
+        let removed = removed_result.unwrap();
         assert_eq!(removed.as_ref().map(|v| &(v[..])), Some(value.as_bytes()));
         assert_eq!(db.get(key.as_bytes()).as_ref().map(|v| &(v[..])), None);
     }
@@ -378,10 +435,11 @@ mod tests {
     fn remove_disk() {
         let tmpdir = tempfile::tempdir().unwrap();
         let db =
-            Database::open_with_config(DatabaseConfig::default().directory(tmpdir.into_path()));
+            Database::open_with_config(DatabaseConfig::default().directory(tmpdir.into_path()))
+                .unwrap();
         let key = String::from("key");
         let value = String::from("value");
-        db.insert(key.as_bytes(), value.as_bytes());
+        db.insert(key.as_bytes(), value.as_bytes()).unwrap();
         assert_eq!(
             db.get(key.as_bytes()).as_ref().map(|v| &(v[..])),
             Some(value.as_bytes())
@@ -389,7 +447,7 @@ mod tests {
 
         db.flush();
 
-        let removed = db.remove(key.as_bytes());
+        let removed = db.remove(key.as_bytes()).unwrap();
         assert_eq!(removed.as_ref().map(|v| &(v[..])), Some(value.as_bytes()));
         assert_eq!(db.get(key.as_bytes()).as_ref().map(|v| &(v[..])), None);
 
@@ -407,7 +465,11 @@ mod tests {
             let disk_table = disk_tables.iter().next().unwrap();
             // test that we didn't store the delete after compaction
             assert_eq!(
-                disk_table.get(key.as_bytes()).as_ref().map(|v| &(v[..])),
+                disk_table
+                    .get(key.as_bytes())
+                    .unwrap()
+                    .as_ref()
+                    .map(|v| &(v[..])),
                 None
             );
         }
@@ -418,12 +480,13 @@ mod tests {
         let tmpdir = tempfile::tempdir().unwrap();
         let db = Database::open_with_config(
             DatabaseConfig::default().directory(tmpdir.path().to_path_buf()),
-        );
+        )
+        .unwrap();
         let key = String::from("key");
 
         for v in 0..9 {
             let value = v.to_string();
-            db.insert(key.as_bytes(), value.as_bytes());
+            db.insert(key.as_bytes(), value.as_bytes()).unwrap();
             db.flush();
             assert_eq!(
                 db.get(key.as_bytes())
@@ -434,7 +497,7 @@ mod tests {
         }
 
         let value = 5.to_string();
-        db.insert(key.as_bytes(), value.as_bytes());
+        db.insert(key.as_bytes(), value.as_bytes()).unwrap();
         db.flush();
         assert_eq!(
             db.get(key.as_bytes())
@@ -454,9 +517,10 @@ mod tests {
 
         let db = Database::open_with_config(
             DatabaseConfig::default().directory(tmpdir.path().to_path_buf()),
-        );
+        )
+        .unwrap();
         let value = 6.to_string();
-        db.insert(key.as_bytes(), value.as_bytes());
+        db.insert(key.as_bytes(), value.as_bytes()).unwrap();
         db.flush();
         assert_eq!(
             db.get(key.as_bytes())
@@ -479,12 +543,12 @@ mod tests {
         const NTHREADS: u32 = 10;
         let mut threads = vec![];
 
-        let db = Database::open();
+        let db = Database::open().unwrap();
         for i in 0..NTHREADS {
             let db_ref = db.clone();
             threads.push(thread::spawn(move || {
                 let value = String::from("value");
-                db_ref.insert(i.to_be_bytes(), value.as_bytes());
+                db_ref.insert(i.to_be_bytes(), value.as_bytes()).unwrap();
             }));
         }
 
@@ -498,16 +562,18 @@ mod tests {
         let mem_table_config = MemTableConfig::default().max_size(200);
         let db = Database::open_with_config(
             DatabaseConfig::default().mem_table_config(mem_table_config),
-        );
+        )
+        .unwrap();
 
         let first_key = String::from("first_key");
         let first_value = String::from("first_value");
-        db.insert(first_key.as_bytes(), first_value.as_bytes());
+        db.insert(first_key.as_bytes(), first_value.as_bytes())
+            .unwrap();
 
         for i in 0..100 {
             let key = format!("key{}", i);
             let value = format!("value{}", i);
-            db.insert(key.as_bytes(), value.as_bytes());
+            db.insert(key.as_bytes(), value.as_bytes()).unwrap();
             assert_eq!(
                 db.get(key.as_bytes()).as_ref().map(|v| &(v[..])),
                 Some(value.as_bytes())
@@ -520,6 +586,15 @@ mod tests {
     }
 
     #[test]
+    fn non_existing_dir() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let mut dir = tmpdir.path().to_path_buf();
+        dir.push("nonexisting");
+        let db = Database::open_with_config(DatabaseConfig::default().directory(dir));
+        assert!(db.is_ok());
+    }
+
+    #[test]
     fn disk() {
         let mem_table_config = MemTableConfig::default().max_size(20);
         let disk_table_config = DiskTableConfig::default().block_size(1024);
@@ -529,7 +604,8 @@ mod tests {
                 .mem_table_config(mem_table_config)
                 .disk_table_config(disk_table_config)
                 .directory(tmpdir.path().to_path_buf()),
-        );
+        )
+        .unwrap();
 
         // Make sure compaction of empty db doesn't do anything
         db.compact();
@@ -540,12 +616,13 @@ mod tests {
 
         let first_key = String::from("first_key");
         let first_value = String::from("first_value");
-        db.insert(first_key.as_bytes(), first_value.as_bytes());
+        db.insert(first_key.as_bytes(), first_value.as_bytes())
+            .unwrap();
 
         for i in 0..100 {
             let key = format!("key{}", i);
             let value = format!("value{}", i);
-            db.insert(key.as_bytes(), value.as_bytes());
+            db.insert(key.as_bytes(), value.as_bytes()).unwrap();
             assert_eq!(
                 db.get(key.as_bytes()).as_ref().map(|v| &(v[..])),
                 Some(value.as_bytes())
@@ -593,7 +670,8 @@ mod tests {
         drop(db);
         let db = Database::open_with_config(
             DatabaseConfig::default().directory(tmpdir.path().to_path_buf()),
-        );
+        )
+        .unwrap();
         for i in 0..100 {
             let key = format!("key{}", i);
             let value = format!("value{}", i);

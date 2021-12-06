@@ -1,6 +1,8 @@
+use crate::error::Error::TooLarge;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+use crate::error::Result;
 use crate::MemTableConfig;
 
 pub struct MemTable {
@@ -40,21 +42,23 @@ impl MemTable {
         }
     }
 
-    pub fn insert<K: AsRef<[u8]>, V: AsRef<[u8]>>(&mut self, key: K, value: V) -> bool {
+    pub fn insert<K: AsRef<[u8]>, V: AsRef<[u8]>>(&mut self, key: K, value: V) -> Result<bool> {
         let entry_size: usize = key.as_ref().len() + value.as_ref().len();
         if entry_size > self.config.max_size {
-            panic!("KeyValue can't be larger than max mem table size!");
+            return Err(TooLarge(String::from(
+                "KeyValue can't be larger than max mem table size",
+            )));
         }
         let new_size = self.size + entry_size;
         if new_size > self.config.max_size {
-            return false;
+            return Ok(false);
         }
         self.entries.insert(
             key.as_ref().to_vec().into_boxed_slice(),
             value.as_ref().to_vec().into_boxed_slice(),
         );
         self.size = new_size;
-        true
+        Ok(true)
     }
 
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<Box<[u8]>> {
