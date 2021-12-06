@@ -343,6 +343,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use std::thread;
+    use test_log::test;
 
     use crate::{Database, DatabaseConfig, DiskTableConfig, MemTableConfig};
 

@@ -1,3 +1,4 @@
+use log::debug;
 use std::cmp::Ordering;
 use std::fs;
 use std::fs::File;
@@ -48,22 +49,22 @@ impl DiskTable {
 
         let mut buf = [0; U64_BYTES];
         let mut index = file.seek(SeekFrom::End(0))?;
-        println!("end position {}", index);
+        debug!("end position {}", index);
 
         index -= U64_BYTES as u64;
         file.read_exact_at(&mut buf, index)?;
         let age = u64::from_le_bytes(buf);
-        println!("age = {}", age);
+        debug!("age = {}", age);
 
         index -= U64_BYTES as u64;
         file.read_exact_at(&mut buf, index)?;
         let num_blocks = u64::from_le_bytes(buf);
-        println!("num_blocks = {}", num_blocks);
+        debug!("num_blocks = {}", num_blocks);
 
         index -= U64_BYTES as u64;
         file.read_exact_at(&mut buf, index)?;
         let starting_block_position = u64::from_le_bytes(buf);
-        println!("starting_block_position = {}", starting_block_position);
+        debug!("starting_block_position = {}", starting_block_position);
 
         file.seek(SeekFrom::Start(starting_block_position))?;
         for _ in 0..num_blocks {
@@ -119,7 +120,7 @@ impl DiskTable {
 
         loop {
             // Create a block
-            println!("Creating block");
+            debug!("Creating block");
             prev = None;
             while let Some((key, value)) = next.as_ref() {
                 let value_ref = value.as_ref();
@@ -149,11 +150,11 @@ impl DiskTable {
                 .as_ref()
                 .map(|kv| kv.0.as_ref().to_vec().into_boxed_slice());
 
-            println!("buf len = {}", buf.len());
+            debug!("buf len = {}", buf.len());
             let (compression_type, block_size) =
                 match compress_to_buffer(&buf, &mut compressed_buf, 0) {
                     Ok(compressed_size) => {
-                        println!("compressed len = {}", compressed_size);
+                        debug!("compressed len = {}", compressed_size);
                         file.write_all(&compressed_buf[..compressed_size])
                             .expect("Write failed");
                         (CompressionType::Zstd, compressed_size)
@@ -200,7 +201,7 @@ impl DiskTable {
         drop(file);
         let file = File::open(path)?;
 
-        println!("{} blocks", blocks.len());
+        debug!("{} blocks", blocks.len());
 
         Ok(DiskTable {
             file,
@@ -378,17 +379,17 @@ impl Block {
 
         file.read_exact(&mut buf)?;
         let first_key_size = u64::from_le_bytes(buf) as usize;
-        println!("first_key_size = {}", first_key_size);
+        debug!("first_key_size = {}", first_key_size);
         let mut first_key = vec![0; first_key_size];
         file.read_exact(&mut first_key)?;
-        println!(
+        debug!(
             "first_key = {}",
             String::from_utf8(first_key.clone()).unwrap()
         );
 
         file.read_exact(&mut buf)?;
         let last_key_size = u64::from_le_bytes(buf) as usize;
-        println!("last_key_size = {}", last_key_size);
+        debug!("last_key_size = {}", last_key_size);
         let mut last_key = vec![0; last_key_size];
         file.read_exact(&mut last_key)?;
 
@@ -439,6 +440,7 @@ mod tests {
     use crate::disk_table::DiskTable;
     use crate::mem_table::MemTable;
     use crate::{DiskTableConfig, MemTableConfig};
+    use test_log::test;
 
     #[test]
     fn write() {
