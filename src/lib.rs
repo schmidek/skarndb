@@ -30,7 +30,7 @@ pub struct MemTableConfig {
 impl MemTableConfig {
     pub fn default() -> MemTableConfig {
         MemTableConfig {
-            max_size: 1_000_000,
+            max_size: 64_000_000,
         }
     }
 
@@ -48,7 +48,7 @@ pub struct DiskTableConfig {
 impl DiskTableConfig {
     pub fn default() -> DiskTableConfig {
         DiskTableConfig {
-            block_size: 64 * 1024,
+            block_size: 256 * 1024,
         }
     }
 
@@ -74,7 +74,7 @@ impl DatabaseConfig {
             disk_table_config: DiskTableConfig::default(),
             directory: None,
             num_flushing_threads: 2,
-            max_mem_tables: 10,
+            max_mem_tables: 4,
         }
     }
 
@@ -562,7 +562,9 @@ mod tests {
     fn overflow_mem_table() {
         let mem_table_config = MemTableConfig::default().max_size(200);
         let db = Database::open_with_config(
-            DatabaseConfig::default().mem_table_config(mem_table_config),
+            DatabaseConfig::default()
+                .mem_table_config(mem_table_config)
+                .max_mem_tables(10),
         )
         .unwrap();
 
